@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>AFSK Messenger</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#111;color:#ccc;font-family:'Courier New',Courier,monospace;font-size:14px;padding:12px;max-width:600px;margin:0 auto}
+#bar{display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:13px}
+#dot{width:14px;height:14px;border-radius:50%;background:red;flex-shrink:0;border:2px solid #800}
+#messages{background:#000;border:1px solid #333;padding:8px;height:300px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.5;margin-bottom:6px}
+.msg{margin-bottom:4px}
+.ts{color:#555}
+.tx{color:#6af}
+.txn{color:#6af;font-weight:bold}
+.rx{color:#4c4}
+.rxn{color:#4c4;font-weight:bold}
+#inputRow{display:flex;gap:6px;margin-bottom:4px}
+#input{flex:1;background:#000;border:1px solid #333;color:#ccc;padding:6px;font-family:inherit;font-size:13px;resize:none;border-radius:0}
+#input:focus{outline:none;border-color:#555}
+#send{background:#146;color:#fff;border:none;padding:6px 14px;font-family:inherit;font-size:13px;cursor:pointer;white-space:nowrap}
+#send:disabled{background:#333;color:#666;cursor:default}
+#ctrl{display:flex;gap:6px;align-items:center;margin-bottom:4px}
+#start{background:#222;color:#ccc;border:1px solid #444;padding:4px 10px;font-family:inherit;font-size:12px;cursor:pointer}
+#start.running{background:#141;border-color:#282}
+#count{color:#555;font-size:12px;margin-left:auto;white-space:nowrap}
+#meter{height:8px;background:#000;border:1px solid #333;margin-bottom:4px;display:flex}
+#meterBar{height:100%;width:0%;background:#0a0;transition:width .1s}
+#prog{height:8px;background:#000;border:1px solid #333;margin-bottom:4px;display:none}
+#progBar{height:100%;width:0%;background:#26a;transition:width .15s}
+#status{font-size:12px;color:#666;margin-left:auto}
+</style>
+</head>
+<body>
+
+<div id="bar">
+  <span id="dot"></span>
+  <span id="syncLabel">Waiting</span>
+  <span id="status">Ready</span>
+</div>
+
+<div id="messages"></div>
+
+<div id="inputRow">
+  <textarea id="input" rows="2" placeholder="Type message &amp; press Enter (PC) or tap Send (mobile)"></textarea>
+  <button id="send" disabled>Send</button>
+</div>
+
+<div id="ctrl">
+  <button id="start">Start Mic</button>
+  <span id="count">0/255</span>
+</div>
+
+<div id="meter"><div id="meterBar"></div></div>
+<div id="prog"><div id="progBar"></div></div>
+
+<script>
+// ─── constants ────────────────────────────────────────────────
+const BAUD = 50;
+const PREAMBLE = 0xAA55;
+const MAX_PAYLOAD = 255;
+const PREAMBLE_BITS = 16;
+const MARK_FREQ = 1200;
+const SPACE_FREQ = 2200;
+const LEAD_FREQ = 1000;
+const LEAD_SEC = 1.0;
+const GAP_SEC = 0.3;
+const TAIL_SEC = 0.5;
+const ENERGY_THRESH = 1e-6;   // minimum total energy to trust a bit
+
+// preamble as bit array
+function makePreambleBits() {
+  var a = [];
+  for (var i = 15; i >= 0; i--) a.push((PREAMBLE >> i) & 1);
+  return a;
+}
+var PREAMBLE_BITS_ARR = makePreambleBits();
+
+// ─── CRC16 ────────────────────────────────────────────────────
+function crc16(data) {
+  var crc = 0xFFFF;
+  for (var i = 0; i < data.length; i++) {
+    crc ^= data[i] << 8;
+    for (var j = 0; j < 8; j++) {
+      if (crc & 0x8000) crc = (crc << 1) ^ 0x1021;
+      else crc <<= 1;
+      crc &= 0xFFFF;
+    }
+  }
+  return crc;
+}
+
+function bytesToBits(arr) {
+  var b = [];
+  for (var i = 0; i < arr.length; i++)
+    for (var j = 7; j >= 0; j--) b.push((arr[i] >> j) & 1);
+  return b;
+}
+
+function bitsToBytes(bits) {
+  var out = [];
+  for (var i = 0; i < bits.length; i += 8) {
+    var v = 0;
+    for (var j = 0; j < 8; j++) v = (v << 1) | (bits[i + j] || 0);
+    out.push(v);
+  }
+  return new Uint8Array(out);
+}
+
+// ─── UI refs ──────────────────────────────────────────────────
+var msgEl = document.getElementById('messages');
+var inputEl = document.getElementById('input');
+var sendBtn = document.getElementById('send');
+var startBtn = document.getElementById('start');
+var countEl = document.getElementById('count');
+var syncLabel = document.getElementById('syncLabel');
+var dotEl = document.getElementById('dot');
+var statusEl = document.getElementById('status');
+var meterBar = document.getElementById('meterBar');
+var progEl = document.getElementById('prog');
+var progBar = document.getElementById('progBar');
+
+var audioCtx = null;
+var micStream = null;
+var scriptNode = null;
+var sourceNode = null;
+var transmitting = false;
+var micRunning = false;
+
+// ─── sync state ───────────────────────────────────────────────
+var syncState = 'idle';
+function setSync(s) {
+  syncState = s;
+  var colors = {idle:'red',receiving:'gold',decoded:'#0c0',tx:'#26a'};
+  var borders = {idle:'#800',receiving:'#960',decoded:'#060',tx:'#136'};
+  var labels = {idle:'Waiting',receiving:'Receiving',decoded:'Message OK',tx:'Transmitting'};
+  dotEl.style.background = colors[s] || 'red';
+  dotEl.style.borderColor = borders[s] || '#800';
+  syncLabel.textContent = labels[s] || 'Waiting';
+}
+
+function setStatus(s) { statusEl.textContent = s; }
+
+// ─── message log ──────────────────────────────────────────────
+function addMsg(dir, text) {
+  var d = new Date();
+  var ts = d.getHours().toString().padStart(2,'0') + ':' +
+           d.getMinutes().toString().padStart(2,'0');
+  var pfx = dir === 'tx' ? '&#8250; TX' : '&#8249; RX';
+  var cls = dir === 'tx' ? 'tx' : 'rx';
+  msgEl.innerHTML += '<div class=msg><span class=ts>[' + ts + ']</span> ' +
+    '<span class=' + cls + 'n>' + pfx + ':</span> ' + escapeHtml(text) + '</div>';
+  msgEl.scrollTop = msgEl.scrollHeight;
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ─── TX audio generation ──────────────────────────────────────
+function modulateFrame(payload) {
+  var frame = new Uint8Array(2 + 1 + payload.length + 2);
+  frame[0] = (PREAMBLE >> 8) & 0xFF;
+  frame[1] = PREAMBLE & 0xFF;
+  frame[2] = payload.length;
+  frame.set(payload, 3);
+  var c = crc16(payload);
+  frame[frame.length - 2] = (c >> 8) & 0xFF;
+  frame[frame.length - 1] = c & 0xFF;
+
+  var bits = bytesToBits(frame);
+  var sr = audioCtx.sampleRate;
+  var symSamples = Math.round(sr / BAUD);
+  var total = bits.length * symSamples;
+  var buf = new Float32Array(total);
+  var phase = 0;
+  var idx = 0;
+  for (var b = 0; b < bits.length; b++) {
+    var freq = bits[b] ? MARK_FREQ : SPACE_FREQ;
+    for (var s = 0; s < symSamples; s++) {
+      buf[idx] = Math.sin(phase);
+      phase += 2 * Math.PI * freq / sr;
+      idx++;
+    }
+  }
+  // normalize
+  var mx = 0;
+  for (var i = 0; i < buf.length; i++) {
+    var v = Math.abs(buf[i]);
+    if (v > mx) mx = v;
+  }
+  if (mx > 0) for (var i = 0; i < buf.length; i++) buf[i] /= mx;
+  return buf;
+}
+
+function generateTone(freq, dur) {
+  var sr = audioCtx.sampleRate;
+  var n = Math.round(sr * dur);
+  var buf = new Float32Array(n);
+  for (var i = 0; i < n; i++)
+    buf[i] = Math.sin(2 * Math.PI * freq * i / sr) * 0.85;
+  return buf;
+}
+
+function generateSilence(dur) {
+  return new Float32Array(Math.round(audioCtx.sampleRate * dur));
+}
+
+function buildTxAudio(payload) {
+  var data = modulateFrame(payload);
+  var lead = generateTone(LEAD_FREQ, LEAD_SEC);
+  var gap = generateSilence(GAP_SEC);
+  var tail = generateTone(LEAD_FREQ, TAIL_SEC);
+  var totalLen = lead.length + gap.length + data.length + tail.length;
+  var out = new Float32Array(totalLen);
+  var off = 0;
+  out.set(lead, off); off += lead.length;
+  out.set(gap, off); off += gap.length;
+  out.set(data, off); off += data.length;
+  out.set(tail, off);
+  return out;
+}
+
+// ─── TX ───────────────────────────────────────────────────────
+function sendMessage(text) {
+  if (transmitting || !audioCtx) return;
+  var payload = new TextEncoder().encode(text);
+  if (payload.length > MAX_PAYLOAD) payload = payload.slice(0, MAX_PAYLOAD);
+
+  transmitting = true;
+  sendBtn.disabled = true;
+  setSync('tx');
+  setStatus('Key PTT now...');
+
+  var audio = buildTxAudio(payload);
+  var sr = audioCtx.sampleRate;
+  var dur = audio.length / sr;
+  var buf = audioCtx.createBuffer(1, audio.length, sr);
+  buf.getChannelData(0).set(audio);
+
+  sourceNode = audioCtx.createBufferSource();
+  sourceNode.buffer = buf;
+  sourceNode.connect(audioCtx.destination);
+
+  // progress bar
+  progEl.style.display = 'block';
+  progBar.style.width = '0%';
+  var startTime = audioCtx.currentTime;
+  function tickProg() {
+    if (!transmitting) { progEl.style.display = 'none'; return; }
+    var elapsed = audioCtx.currentTime - startTime;
+    var pct = Math.min(100, (elapsed / dur) * 100);
+    progBar.style.width = pct + '%';
+    setStatus('TX ' + Math.round(pct) + '%  (release PTT after bar fills)');
+    requestAnimationFrame(tickProg);
+  }
+  requestAnimationFrame(tickProg);
+
+  sourceNode.onended = function() {
+    transmitting = false;
+    sendBtn.disabled = false;
+    progEl.style.display = 'none';
+    setSync('idle');
+    setStatus('Ready');
+    sourceNode = null;
+  };
+
+  sourceNode.start();
+  addMsg('tx', text);
+  inputEl.value = '';
+  updateCount();
+}
+
+// ─── RX processing ────────────────────────────────────────────
+var rxBuf = [];           // raw sample accumulator
+var rxBits = [];          // decoded bit stream
+var inFrame = false;
+var frameBits = [];
+var payloadLen = 0;
+var remainingBits = 0;
+var maxFrameBits = 8 + MAX_PAYLOAD * 8 + 16;
+var symSamples = 0;
+var cosMark = null, sinMark = null, cosSpace = null, sinSpace = null;
+
+function initRxRefs(sr) {
+  symSamples = Math.round(sr / BAUD);
+  var t = new Float32Array(symSamples);
+  for (var i = 0; i < symSamples; i++) t[i] = i / sr;
+  cosMark = new Float32Array(symSamples);
+  sinMark = new Float32Array(symSamples);
+  cosSpace = new Float32Array(symSamples);
+  sinSpace = new Float32Array(symSamples);
+  for (var i = 0; i < symSamples; i++) {
+    cosMark[i] = Math.cos(2 * Math.PI * MARK_FREQ * t[i]);
+    sinMark[i] = Math.sin(2 * Math.PI * MARK_FREQ * t[i]);
+    cosSpace[i] = Math.cos(2 * Math.PI * SPACE_FREQ * t[i]);
+    sinSpace[i] = Math.sin(2 * Math.PI * SPACE_FREQ * t[i]);
+  }
+}
+
+function detectBit(samples, len) {
+  var im = 0, qm = 0, is = 0, qs = 0;
+  for (var i = 0; i < len; i++) {
+    var s = samples[i];
+    im += s * cosMark[i];
+    qm += s * sinMark[i];
+    is += s * cosSpace[i];
+    qs += s * sinSpace[i];
+  }
+  var em = im*im + qm*qm;
+  var es = is*is + qs*qs;
+  return { bit: em > es ? 1 : 0, energy: em + es, conf: Math.abs(em - es) };
+}
+
+function tryDecode(bits) {
+  var bytes = bitsToBytes(bits);
+  if (bytes.length < 3) return null;
+  var rl = bytes[0];
+  if (rl === 0 || rl > MAX_PAYLOAD || bytes.length < rl + 3) return null;
+  var payload = bytes.slice(1, 1 + rl);
+  var rcrc = (bytes[1 + rl] << 8) | bytes[2 + rl];
+  if (rcrc === crc16(payload)) return payload;
+  return null;
+}
+
+function onAudioProcess(e) {
+  if (transmitting) return;
+
+  // prevent buffer from growing unbounded
+  if (rxBuf.length > symSamples * 150) {
+    rxBuf.splice(0, rxBuf.length - symSamples * 50);
+    rxBits = [];
+    inFrame = false;
+  }
+
+  var samples = e.inputBuffer.getChannelData(0);
+  var sr = audioCtx.sampleRate;
+
+  // volume meter
+  var rms = 0;
+  for (var i = 0; i < samples.length; i++) rms += samples[i] * samples[i];
+  rms = Math.sqrt(rms / samples.length);
+  var level = Math.min(1, rms * 10);
+  meterBar.style.width = (level * 100) + '%';
+  meterBar.style.background = level < 0.3 ? '#0a0' : level < 0.65 ? '#a80' : level < 0.85 ? '#a50' : '#a00';
+
+  // DC block
+  var mean = 0;
+  for (var i = 0; i < samples.length; i++) mean += samples[i];
+  mean /= samples.length;
+
+  // accumulate
+  for (var i = 0; i < samples.length; i++) rxBuf.push(samples[i] - mean);
+
+  var processed = 0;
+  while (rxBuf.length >= symSamples) {
+    var chunk = rxBuf.splice(0, symSamples);
+
+    if (!inFrame) {
+      // detect bit
+      var d = detectBit(chunk, symSamples);
+      if (d.energy > ENERGY_THRESH) {
+        rxBits.push(d.bit);
+      } else {
+        rxBits.push(0); // low energy = arbitrary, won't match preamble
+      }
+
+      // check for preamble in last 16 bits
+      if (rxBits.length >= PREAMBLE_BITS) {
+        var match = true;
+        for (var k = 0; k < PREAMBLE_BITS; k++) {
+          if (rxBits[rxBits.length - PREAMBLE_BITS + k] !== PREAMBLE_BITS_ARR[k]) {
+            match = false;
+            break;
+          }
+        }
+        if (match) {
+          // preamble found
+          rxBits = [];
+          inFrame = true;
+          frameBits = [];
+          payloadLen = 0;
+          remainingBits = 0;
+          setSync('receiving');
+        }
+      }
+
+      // trim
+      if (rxBits.length > 10000) rxBits = rxBits.slice(-1000);
+    } else {
+      // reading frame
+      var d = detectBit(chunk, symSamples);
+      frameBits.push(d.bit);
+
+      if (frameBits.length === 8 && remainingBits === 0) {
+        var val = 0;
+        for (var k = 0; k < 8; k++) val = (val << 1) | frameBits[k];
+        if (val === 0 || val > MAX_PAYLOAD) {
+          inFrame = false;
+          setSync('idle');
+          continue;
+        }
+        payloadLen = val;
+        remainingBits = 8 + payloadLen * 8 + 16;
+      }
+
+      if (remainingBits > 0 && frameBits.length >= remainingBits) {
+        var fb = frameBits.slice(0, remainingBits);
+        var payload = tryDecode(fb);
+        if (payload !== null) {
+          var text = new TextDecoder().decode(payload);
+          addMsg('rx', text);
+          setSync('decoded');
+          setTimeout(function() { if (syncState === 'decoded') setSync('idle'); }, 2500);
+        }
+        inFrame = false;
+        setSync('idle');
+        continue;
+      }
+
+      if (frameBits.length > maxFrameBits) {
+        inFrame = false;
+        setSync('idle');
+      }
+    }
+  }
+
+  // sync state update for receiving
+  if (inFrame && syncState !== 'receiving' && syncState !== 'decoded') {
+    setSync('receiving');
+  }
+}
+
+// ─── mic start/stop ──────────────────────────────────────────
+function startMic() {
+  if (micRunning) {
+    // stop
+    if (scriptNode) scriptNode.disconnect();
+    if (micStream) micStream.getTracks().forEach(function(t) { t.stop(); });
+    micRunning = false;
+    startBtn.textContent = 'Start Mic';
+    startBtn.classList.remove('running');
+    setSync('idle');
+    setStatus('Ready');
+    return;
+  }
+
+  // clear RX state
+  rxBuf = [];
+  rxBits = [];
+  inFrame = false;
+  frameBits = [];
+
+  navigator.mediaDevices.getUserMedia({audio:true})
+  .then(function(stream) {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    var sr = audioCtx.sampleRate;
+    initRxRefs(sr);
+
+    micStream = stream;
+    var mic = audioCtx.createMediaStreamSource(stream);
+    scriptNode = audioCtx.createScriptProcessor(4096, 1, 1);
+    scriptNode.onaudioprocess = onAudioProcess;
+    mic.connect(scriptNode);
+    scriptNode.connect(audioCtx.destination); // needed for some browsers
+
+    micRunning = true;
+    startBtn.textContent = 'Stop Mic';
+    startBtn.classList.add('running');
+    setStatus('Mic active — ' + sr + ' Hz');
+    sendBtn.disabled = false;
+  })
+  .catch(function(err) {
+    setStatus('Mic error: ' + err.message);
+  });
+}
+
+// ─── UI events ────────────────────────────────────────────────
+startBtn.addEventListener('click', startMic);
+
+sendBtn.addEventListener('click', function() {
+  var text = inputEl.value.trim();
+  if (text && !transmitting) sendMessage(text);
+});
+
+inputEl.addEventListener('keydown', function(e) {
+  // Enter (without Shift) sends on desktop
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    var text = inputEl.value.trim();
+    if (text && !transmitting) sendMessage(text);
+  }
+});
+
+inputEl.addEventListener('input', updateCount);
+
+function updateCount() {
+  var n = inputEl.value.length;
+  countEl.textContent = n + '/255';
+  countEl.style.color = n > 255 ? '#c00' : '#555';
+}
+
+// initial state
+setSync('idle');
+setStatus('Tap "Start Mic" to begin');
+</script>
+</body>
+</html>
