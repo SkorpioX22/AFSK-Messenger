@@ -1,5 +1,18 @@
 # AFSK Messenger (Web)
-https://skorpiox22.github.io/AFSK-Messenger/
+
+## LEGAL DISCLAIMER
+
+This software is a tool for generating and decoding audio-frequency tones. It does not itself transmit radio frequency energy. Any use of this tool to transmit over radio frequencies must comply with all applicable laws and regulations in your jurisdiction.
+
+- **Amateur (ham) radio bands** may only be used by individuals holding a valid amateur radio license issued by the relevant regulatory authority (e.g., FCC in the United States, OFCOM in the UK, ACMA in Australia). Unlicensed transmission on amateur bands is illegal.
+- **Family Radio Service (FRS), General Mobile Radio Service (GMRS), Personal Mobile Radio (PMR), and similar license-free or license-by-rule services** have their own power, channel, and operational restrictions. You are responsible for understanding and following those rules.
+- **Business, public safety, and other licensed radio services** require authorization from the license holder.
+- Using this tool for any unlawful purpose, including but not limited to interference with licensed communications, is strictly prohibited.
+
+This software is provided for educational and experimental use. The authors assume no liability for any violations of law resulting from its use.
+
+---
+
 A browser-based text-over-radio application that encodes messages as AFSK (Audio Frequency-Shift Keying) tones and decodes received audio from a microphone. Designed to work with handheld radios such as Baofeng UV-5R by coupling the computer speaker to the radio microphone and the radio speaker to the computer microphone.
 
 ## How it works
